@@ -1,4 +1,206 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>临床试验筛选与随机化</title>
+<style>
+  body{font:15px system-ui,sans-serif;max-width:1060px;margin:24px auto;padding:0 16px;color:#222}
+  h1{font-size:22px} h2{font-size:17px;margin:0 0 10px}
+  .panel{border:1px solid #bbb;border-radius:8px;padding:14px;margin-bottom:16px;background:#fff}
+  .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  select,input,button{padding:7px 9px;font-size:14px}
+  button{cursor:pointer;border:1px solid #888;border-radius:5px;background:#f6f7f9}
+  button.primary{background:#2457a6;color:#fff;border-color:#2457a6}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  table{border-collapse:collapse;width:100%;font-size:13.5px}
+  th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;vertical-align:top}
+  th{background:#f3f4f6}
+  .badge{display:inline-block;padding:2px 9px;border-radius:11px;font-size:12px;color:#fff;white-space:nowrap}
+  .s-eligible{background:#1a7f37}.s-pending{background:#b26a00}.s-failed{background:#c0392b}
+  .s-enrolled{background:#57606a}
+  .reasons{margin:4px 0 0;padding-left:16px;color:#8a3b12}
+  .reasons li{margin:1px 0}
+  .cfg{font-size:13.5px;color:#444}
+  .cfg b{color:#222}
+  .form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:8px 0}
+  .form-grid label{font-size:12.5px;color:#555;display:flex;flex-direction:column;gap:3px}
+  #msg{white-space:pre-wrap;font-size:13px;margin:8px 0 0}
+  #msg.ok{color:#1a7f37}#msg.err{color:#c0392b}
+  .muted{color:#888;font-size:12.5px}
+  pre.dbg{background:#f4f4f4;padding:10px;white-space:pre-wrap;font-size:12px;display:none}
+</style>
+</head>
+<body>
+<h1>临床试验入组前筛选与随机分配</h1>
+
+<div class="panel">
+  <div class="bar">
+    <label>用户
+      <select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select>
+    </label>
+    <label>试验ID <input id="trial" value="1" size="4"></label>
+    <button onclick="loadAll()">刷新</button>
+    <button onclick="showSummary()">查看试验摘要/审计</button>
+  </div>
+  <div id="cfg" class="cfg" style="margin-top:10px"></div>
+</div>
+
+<div class="panel" id="createPanel">
+  <h2>新建筛选（仅中心用户，按当前用户所在中心隔离）</h2>
+  <div class="form-grid">
+    <label>受试者编号<input id="f_ext" placeholder="如 P-010"></label>
+    <label>知情同意日期<input id="f_consent" type="date"></label>
+    <label>年龄（周岁）<input id="f_age" type="number" min="0" max="150" placeholder="未出结果可留空"></label>
+    <label>关键化验日期<input id="f_labdate" type="date"></label>
+    <label>关键化验结果
+      <select id="f_labresult"><option value="">未回报</option><option value="normal">正常</option><option value="abnormal">异常</option></select>
+    </label>
+  </div>
+  <button class="primary" onclick="createScreening()">登记筛选</button>
+  <div id="msg"></div>
+</div>
+
+<div class="panel">
+  <h2>筛选记录</h2>
+  <table>
+    <thead><tr>
+      <th>编号 / 轮次</th><th>受试者</th><th>中心</th><th>知情同意</th><th>年龄</th>
+      <th>化验日期</th><th>化验结果</th><th>判定状态 / 原因</th><th>操作</th>
+    </tr></thead>
+    <tbody id="rows"><tr><td colspan="9" class="muted">点击“刷新”加载。</td></tr></tbody>
+  </table>
+</div>
+
+<div class="panel">
+  <h2>接口返回（调试）</h2>
+  <pre class="dbg" id="out"></pre>
+</div>
+
+<script>
+const STATUS = {eligible:["合格","s-eligible"], pending:["待复核","s-pending"], failed:["不合格","s-failed"], enrolled:["已入组","s-enrolled"]};
+const $ = id => document.getElementById(id);
+function headers(){return {"X-User-Id":$("user").value, "Content-Type":"application/json"};}
+function trialId(){return parseInt($("trial").value,10);}
+function setMsg(t, cls){const m=$("msg"); m.textContent=t||""; m.className=cls||"";}
+
+async function api(method, url, body){
+  const opt={method, headers:headers()};
+  if(body) opt.body=JSON.stringify(body);
+  const r = await fetch(url, opt); const data = await r.json();
+  $("out").style.display="block"; $("out").textContent = `HTTP ${r.status}  ${method} ${url}\n`+JSON.stringify(data,null,2);
+  if(!r.ok) throw Object.assign(new Error(data.error?.message||"请求失败"), {data});
+  return data;
+}
+
+async function loadConfig(){
+  try{
+    const t = await api("GET", `/api/trials/${trialId()}`);
+    $("cfg").innerHTML = `试验 <b>${t.name}</b>（方案 ${t.protocol_version}，状态：${t.status}）；
+      最低入组年龄 <b>${t.min_age}</b> 周岁；关键化验有效期 <b>${t.lab_validity_days}</b> 天；
+      分层因素：${t.strata_factors.join("、")}`;
+  }catch(e){ $("cfg").textContent = "无法读取试验配置："+e.message; }
+}
+
+function badge(s){const [txt,cls]=STATUS[s]||[s,""];return `<span class="badge ${cls}">${txt}</span>`;}
+function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+
+async function loadRows(){
+  const data = await api("GET", `/api/trials/${trialId()}/screenings`);
+  const roleSite = $("user").value.startsWith("site");
+  if(!data.items.length){ $("rows").innerHTML = `<tr><td colspan="9" class="muted">本中心/本试验暂无筛选记录。</td></tr>`; return; }
+  $("rows").innerHTML = data.items.map(r=>{
+    const reasons = r.reasons.length ? `<ul class="reasons">${r.reasons.map(x=>`<li>${esc(x.code)}：${esc(x.message)}</li>`).join("")}</ul>` : "";
+    let acts = "";
+    if(roleSite){
+      if(r.status==="eligible")
+        acts += `<button class="primary" onclick='enroll(${r.id})'>入组（发随机号）</button> `;
+      if(r.status==="failed")
+        acts += `<button onclick='rescreen(${r.id})'>重筛</button> `;
+      if(r.status!=="enrolled")
+        acts += `<button onclick='editRow(${r.id})'>补录/更正资料</button>`;
+    }
+    return `<tr>
+      <td>#${r.id}<br><span class="muted">第 ${r.attempt} 轮</span></td>
+      <td>${esc(r.external_id)}${r.participant_id?`<br><span class="muted">受试者#${r.participant_id}</span>`:""}</td>
+      <td>${esc(r.site_id)}</td>
+      <td>${esc(r.consent_date)||"—"}</td>
+      <td>${r.age??"—"}</td>
+      <td>${esc(r.lab_date)||"—"}</td>
+      <td>${r.lab_result==="normal"?"正常":r.lab_result==="abnormal"?`<span style="color:#c0392b">异常</span>`:"未回报"}</td>
+      <td>${badge(r.status)}${reasons}</td>
+      <td>${acts||'<span class="muted">无</span>'}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function loadAll(){ setMsg(""); await loadConfig(); try{ await loadRows(); }catch(e){ setMsg(e.message,"err"); } }
+async function showSummary(){
+  try{ const d=await api("GET", `/api/trials/${trialId()}/summary`); $("out").style.display="block"; $("out").textContent=JSON.stringify(d,null,2); }
+  catch(e){ setMsg(e.message,"err"); }
+}
+
+function formBody(){
+  const b={};
+  const g=(id)=>$(id).value;
+  if(g("f_consent")) b.consent_date=g("f_consent");
+  if(g("f_age")!=="") b.age=parseInt(g("f_age"),10);
+  if(g("f_labdate")) b.lab_date=g("f_labdate");
+  if(g("f_labresult")) b.lab_result=g("f_labresult");
+  return b;
+}
+
+async function createScreening(){
+  setMsg("");
+  const ext=$("f_ext").value.trim();
+  if(!ext){ setMsg("请填写受试者编号","err"); return; }
+  try{
+    await api("POST", `/api/trials/${trialId()}/screenings`, Object.assign({external_id:ext}, formBody()));
+    setMsg("筛选已登记并完成判定。","ok"); await loadRows();
+  }catch(e){ setMsg(e.message,"err"); }
+}
+
+async function editRow(id){
+  const consent=prompt("知情同意日期（YYYY-MM-DD，留空清空）","");
+  if(consent===null) return;
+  const age=prompt("年龄（整数，留空表示未登记）","");
+  if(age===null) return;
+  const labdate=prompt("关键化验日期（YYYY-MM-DD，留空清空）","");
+  if(labdate===null) return;
+  const labresult=prompt("化验结果：normal / abnormal，留空表示未回报","");
+  if(labresult===null) return;
+  const body={};
+  if(consent!=="") body.consent_date=consent; else body.consent_date=null;
+  if(age!=="") body.age=parseInt(age,10); else body.age=null;
+  if(labdate!=="") body.lab_date=labdate; else body.lab_date=null;
+  if(labresult.trim()!=="") body.lab_result=labresult.trim(); else body.lab_result=null;
+  try{ await api("PATCH", `/api/screenings/${id}`, body); setMsg("资料已更新并重新判定。","ok"); await loadRows(); }
+  catch(e){ setMsg(e.message,"err"); }
+}
+
+async function rescreen(id){
+  if(!confirm("确认对该筛败受试者发起重筛？历史记录将保留。")) return;
+  try{ await api("POST", `/api/screenings/${id}/rescreen`); setMsg("已发起新一轮筛选，请补录关键化验。","ok"); await loadRows(); }
+  catch(e){ setMsg(e.message,"err"); }
+}
+
+async function enroll(id){
+  // 分层因素取试验配置的第一个，页面上以 JSON 录入以支持多因素
+  let factors;
+  try{
+    const t = await (await fetch(`/api/trials/${trialId()}`,{headers:headers()})).json();
+    const raw = prompt("请输入分层因素 JSON：", JSON.stringify(Object.fromEntries(t.strata_factors.map(f=>[f,"low"]))));
+    if(raw===null) return;
+    factors = JSON.parse(raw);
+  }catch(e){ setMsg("分层因素 JSON 无效："+e.message,"err"); return; }
+  try{
+    const p = await api("POST", `/api/trials/${trialId()}/enroll`, {screening_id:id, factors});
+    setMsg(`入组成功，随机/分配编号：${p.allocation_code}（分组按盲法隐藏）。${p.idempotent?"（幂等返回）":""}`, "ok");
+    await loadRows();
+  }catch(e){ setMsg(e.message,"err"); }
+}
+
+$("user").addEventListener("change", loadAll);
+loadAll();
+</script>
+</body>
+</html>
