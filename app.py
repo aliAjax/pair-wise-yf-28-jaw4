@@ -10,17 +10,18 @@ import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "randomization.db"
 MAX_ARM_LENGTH = 40
+LAB_RESULTS = ("normal", "abnormal", "pending")
 
 
 class BusinessError(Exception):
-    def __init__(self, message, status=400, code="bad_request"):
+    def __init__(self, message, status=400, code="bad_request", detail=None):
         super().__init__(message)
-        self.message, self.status, self.code = message, status, code
+        self.message, self.status, self.code, self.detail = message, status, code, detail
 
 
 def now():
@@ -55,6 +56,8 @@ class RandomizationStore:
                     arms_json TEXT NOT NULL, strata_factors_json TEXT NOT NULL,
                     block_size INTEGER NOT NULL CHECK(block_size >= 2),
                     seed TEXT NOT NULL, created_by TEXT NOT NULL REFERENCES users(id),
+                    min_age INTEGER NOT NULL CHECK(min_age >= 0),
+                    lab_validity_days INTEGER NOT NULL CHECK(lab_validity_days >= 1),
                     created_at TEXT NOT NULL, started_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS strata(
@@ -82,6 +85,21 @@ class RandomizationStore:
                     enrolled_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
                     UNIQUE(trial_id,external_id)
                 );
+                CREATE TABLE IF NOT EXISTS screenings(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trial_id INTEGER NOT NULL REFERENCES trials(id),
+                    site_id TEXT NOT NULL, external_id TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    consent_signed INTEGER NOT NULL CHECK(consent_signed IN (0,1)),
+                    consent_date TEXT, age INTEGER NOT NULL,
+                    lab_date TEXT NOT NULL, lab_result TEXT NOT NULL
+                        CHECK(lab_result IN ('normal','abnormal','pending')),
+                    status TEXT NOT NULL CHECK(status IN ('eligible','ineligible','pending_review')),
+                    reasons_json TEXT NOT NULL,
+                    superseded INTEGER NOT NULL DEFAULT 0 CHECK(superseded IN (0,1)),
+                    created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
+                    UNIQUE(trial_id,site_id,external_id,attempt)
+                );
                 CREATE TABLE IF NOT EXISTS unblinding_requests(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     participant_id INTEGER NOT NULL REFERENCES participants(id),
@@ -97,6 +115,10 @@ class RandomizationStore:
                 );
                 """
             )
+            trial_cols = {row[1] for row in conn.execute("PRAGMA table_info(trials)")}
+            if "min_age" not in trial_cols:
+                conn.execute("ALTER TABLE trials ADD COLUMN min_age INTEGER NOT NULL DEFAULT 0")
+                conn.execute("ALTER TABLE trials ADD COLUMN lab_validity_days INTEGER NOT NULL DEFAULT 30")
 
     def seed(self):
         self.init_schema()
@@ -134,7 +156,14 @@ class RandomizationStore:
             (trial_id, actor, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), now()),
         )
 
-    def create_trial(self, user_id, name, protocol_version, arms, strata_factors, block_size, seed):
+    @staticmethod
+    def _validate_screening_criteria(min_age, lab_validity_days):
+        if isinstance(min_age, bool) or not isinstance(min_age, int) or not 0 <= min_age <= 120:
+            raise BusinessError("最低年龄必须是 0 到 120 的整数", 422, "invalid_min_age")
+        if isinstance(lab_validity_days, bool) or not isinstance(lab_validity_days, int) or not 1 <= lab_validity_days <= 365:
+            raise BusinessError("化验有效期必须是 1 到 365 的整数天数", 422, "invalid_lab_validity")
+
+    def create_trial(self, user_id, name, protocol_version, arms, strata_factors, block_size, seed, min_age, lab_validity_days):
         name = name.strip()
         if len(name) < 3 or not protocol_version.strip() or len(seed.strip()) < 8:
             raise BusinessError("试验名称、方案版本和至少 8 位随机种子不能为空", 422, "invalid_trial")
@@ -147,21 +176,22 @@ class RandomizationStore:
             raise BusinessError("分层因素必须是非空且不重复的数组", 422, "invalid_strata")
         if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size < len(arms) or block_size % len(arms) != 0:
             raise BusinessError("区组长度必须为试验组数的正整数倍", 422, "invalid_block_size")
+        self._validate_screening_criteria(min_age, lab_validity_days)
         with self.connect() as conn:
             actor = self._user(conn, user_id, {"coordinator"})
             try:
                 cur = conn.execute(
-                    """INSERT INTO trials(name,protocol_version,arms_json,strata_factors_json,block_size,seed,created_by,created_at)
-                       VALUES(?,?,?,?,?,?,?,?)""",
-                    (name, protocol_version.strip(), json.dumps(arms), json.dumps([str(x).strip() for x in strata_factors]), block_size, seed.strip(), user_id, now()),
+                    """INSERT INTO trials(name,protocol_version,arms_json,strata_factors_json,block_size,seed,created_by,min_age,lab_validity_days,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (name, protocol_version.strip(), json.dumps(arms), json.dumps([str(x).strip() for x in strata_factors]), block_size, seed.strip(), user_id, min_age, lab_validity_days, now()),
                 )
             except sqlite3.IntegrityError:
                 raise BusinessError("试验名称已存在", 409, "trial_exists")
             trial_id = cur.lastrowid
-            self._audit(conn, trial_id, user_id, "trial.create", {"protocol_version": protocol_version, "arms": len(arms), "block_size": block_size})
-            return {"id": trial_id, "name": name, "status": "draft", "arms": arms, "strata_factors": strata_factors, "block_size": block_size}
+            self._audit(conn, trial_id, user_id, "trial.create", {"protocol_version": protocol_version, "arms": len(arms), "block_size": block_size, "min_age": min_age, "lab_validity_days": lab_validity_days})
+            return {"id": trial_id, "name": name, "status": "draft", "arms": arms, "strata_factors": strata_factors, "block_size": block_size, "min_age": min_age, "lab_validity_days": lab_validity_days}
 
-    def update_protocol(self, user_id, trial_id, protocol_version, arms=None, strata_factors=None, block_size=None, seed=None):
+    def update_protocol(self, user_id, trial_id, protocol_version, arms=None, strata_factors=None, block_size=None, seed=None, min_age=None, lab_validity_days=None):
         with self.connect() as conn:
             actor = self._user(conn, user_id, {"coordinator"})
             trial = self._trial(conn, trial_id)
@@ -172,13 +202,16 @@ class RandomizationStore:
             new_strata = strata_factors if strata_factors is not None else json.loads(trial["strata_factors_json"])
             new_block = block_size if block_size is not None else trial["block_size"]
             new_seed = str(seed) if seed is not None else trial["seed"]
+            new_min_age = min_age if min_age is not None else trial["min_age"]
+            new_validity = lab_validity_days if lab_validity_days is not None else trial["lab_validity_days"]
             self.create_trial_validation_only(new_arms, new_strata, new_block, new_seed)
+            self._validate_screening_criteria(new_min_age, new_validity)
             conn.execute(
-                """UPDATE trials SET protocol_version=?,arms_json=?,strata_factors_json=?,block_size=?,seed=? WHERE id=?""",
-                (protocol_version.strip(), json.dumps(new_arms), json.dumps(new_strata), new_block, new_seed, trial_id),
+                """UPDATE trials SET protocol_version=?,arms_json=?,strata_factors_json=?,block_size=?,seed=?,min_age=?,lab_validity_days=? WHERE id=?""",
+                (protocol_version.strip(), json.dumps(new_arms), json.dumps(new_strata), new_block, new_seed, new_min_age, new_validity, trial_id),
             )
-            self._audit(conn, trial_id, user_id, "protocol.update", {"protocol_version": protocol_version})
-            return {"id": trial_id, "protocol_version": protocol_version, "arms": new_arms, "block_size": new_block}
+            self._audit(conn, trial_id, user_id, "protocol.update", {"protocol_version": protocol_version, "min_age": new_min_age, "lab_validity_days": new_validity})
+            return {"id": trial_id, "protocol_version": protocol_version, "arms": new_arms, "block_size": new_block, "min_age": new_min_age, "lab_validity_days": new_validity}
 
     @staticmethod
     def create_trial_validation_only(arms, strata_factors, block_size, seed):
@@ -200,6 +233,129 @@ class RandomizationStore:
             conn.execute("UPDATE trials SET status='running',started_at=? WHERE id=?", (now(), trial_id))
             self._audit(conn, trial_id, user_id, "trial.start", {})
             return {"id": trial_id, "status": "running"}
+
+    @staticmethod
+    def _parse_date(value, label, allow_none=False):
+        if value is None or str(value).strip() == "":
+            if allow_none:
+                return None
+            raise BusinessError(f"{label}不能为空", 422, "invalid_date")
+        try:
+            parsed = datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
+        except ValueError:
+            raise BusinessError(f"{label}必须是 YYYY-MM-DD 格式", 422, "invalid_date")
+        if parsed > datetime.now(timezone.utc).date():
+            raise BusinessError(f"{label}不能晚于今天", 422, "invalid_date")
+        return parsed
+
+    @staticmethod
+    def _evaluate_screening(trial, consent, age, lab_on, lab_result):
+        today = datetime.now(timezone.utc).date()
+        failed, review = [], []
+        if not consent:
+            failed.append("未签署知情同意")
+        if age < trial["min_age"]:
+            failed.append(f"年龄 {age} 岁低于方案最低年龄 {trial['min_age']} 岁")
+        if lab_result == "pending":
+            review.append("关键化验结果未回报")
+        elif lab_result == "abnormal":
+            review.append("关键化验结果异常，需研究者复核")
+        if (today - lab_on).days > trial["lab_validity_days"]:
+            review.append(f"关键化验已超出 {trial['lab_validity_days']} 天有效期，需复查")
+        if failed:
+            return "ineligible", failed + review
+        if review:
+            return "pending_review", review
+        return "eligible", []
+
+    @staticmethod
+    def _lab_expired(trial, lab_date_str):
+        lab_on = datetime.strptime(lab_date_str, "%Y-%m-%d").date()
+        return (datetime.now(timezone.utc).date() - lab_on).days > trial["lab_validity_days"]
+
+    def _screening_view(self, trial, row):
+        expired = self._lab_expired(trial, row["lab_date"])
+        return {
+            "id": row["id"], "trial_id": row["trial_id"], "site_id": row["site_id"],
+            "external_id": row["external_id"], "attempt": row["attempt"],
+            "consent_signed": bool(row["consent_signed"]), "consent_date": row["consent_date"],
+            "age": row["age"], "lab_date": row["lab_date"], "lab_result": row["lab_result"],
+            "status": row["status"], "reasons": json.loads(row["reasons_json"]),
+            "lab_expired": expired,
+            "enrollable": row["status"] == "eligible" and not expired and not row["superseded"],
+            "superseded": bool(row["superseded"]),
+            "created_by": row["created_by"], "created_at": row["created_at"],
+        }
+
+    def submit_screening(self, user_id, trial_id, external_id, consent_signed, consent_date, age, lab_date, lab_result):
+        external_id = str(external_id).strip()
+        if not external_id:
+            raise BusinessError("外部受试者编号不能为空", 422, "invalid_external_id")
+        if isinstance(consent_signed, bool):
+            consent = consent_signed
+        elif consent_signed in (0, 1):
+            consent = bool(consent_signed)
+        else:
+            raise BusinessError("知情同意签署状态必须是布尔值", 422, "invalid_consent")
+        consent_on = self._parse_date(consent_date, "知情同意日期", allow_none=not consent)
+        if isinstance(age, bool) or not isinstance(age, int) or not 0 <= age <= 150:
+            raise BusinessError("年龄必须是 0 到 150 的整数", 422, "invalid_age")
+        lab_on = self._parse_date(lab_date, "关键化验日期")
+        if lab_result not in LAB_RESULTS:
+            raise BusinessError("关键化验结果必须是 normal/abnormal/pending", 422, "invalid_lab_result")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                actor = self._user(conn, user_id, {"site"})
+                trial = self._trial(conn, trial_id)
+                if trial["status"] == "stopped":
+                    raise BusinessError("试验已停止，不能登记筛选", 409, "trial_not_running")
+                enrolled = conn.execute(
+                    "SELECT 1 FROM participants WHERE trial_id=? AND site_id=? AND external_id=?",
+                    (trial_id, actor["site_id"], external_id),
+                ).fetchone()
+                if enrolled:
+                    raise BusinessError("受试者已入组，筛选记录已锁定", 409, "screening_locked")
+                prev = conn.execute(
+                    "SELECT COALESCE(MAX(attempt),0) FROM screenings WHERE trial_id=? AND site_id=? AND external_id=?",
+                    (trial_id, actor["site_id"], external_id),
+                ).fetchone()[0]
+                attempt = prev + 1
+                status, reasons = self._evaluate_screening(trial, consent, age, lab_on, lab_result)
+                conn.execute(
+                    "UPDATE screenings SET superseded=1 WHERE trial_id=? AND site_id=? AND external_id=?",
+                    (trial_id, actor["site_id"], external_id),
+                )
+                cur = conn.execute(
+                    """INSERT INTO screenings(trial_id,site_id,external_id,attempt,consent_signed,consent_date,age,lab_date,lab_result,status,reasons_json,created_by,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (trial_id, actor["site_id"], external_id, attempt, int(consent),
+                     consent_on.isoformat() if consent_on else None, age, lab_on.isoformat(), lab_result,
+                     status, json.dumps(reasons, ensure_ascii=False), user_id, now()),
+                )
+                self._audit(conn, trial_id, user_id, "screening.submit",
+                            {"external_id": external_id, "attempt": attempt, "status": status, "reasons": reasons, "site_id": actor["site_id"]})
+                row = conn.execute("SELECT * FROM screenings WHERE id=?", (cur.lastrowid,)).fetchone()
+                return self._screening_view(trial, row)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def list_screenings(self, user_id, trial_id, external_id=None):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            trial = self._trial(conn, trial_id)
+            sql, params = "SELECT * FROM screenings WHERE trial_id=?", [trial_id]
+            if actor["role"] == "site":
+                sql += " AND site_id=?"
+                params.append(actor["site_id"])
+            if external_id:
+                sql += " AND external_id=?"
+                params.append(str(external_id).strip())
+            else:
+                sql += " AND superseded=0"
+            rows = conn.execute(sql + " ORDER BY site_id,external_id,attempt", params).fetchall()
+            return [self._screening_view(trial, row) for row in rows]
 
     def _stratum(self, conn, trial, factors, site_id):
         expected = json.loads(trial["strata_factors_json"])
@@ -265,6 +421,22 @@ class RandomizationStore:
                         raise BusinessError("不能在当前中心查看其他中心的受试者", 403, "site_isolation")
                     conn.commit()
                     return self._blinded_participant(conn, existing, actor, allow_arm=False, idempotent=True)
+                screening = conn.execute(
+                    "SELECT * FROM screenings WHERE trial_id=? AND site_id=? AND external_id=? AND superseded=0",
+                    (trial_id, actor["site_id"], external_id),
+                ).fetchone()
+                if not screening:
+                    raise BusinessError("受试者未完成入组前筛选，不能分配随机号", 409, "screening_required")
+                reasons = json.loads(screening["reasons_json"])
+                if screening["status"] == "ineligible":
+                    raise BusinessError("筛选不合格，不能入组：" + "；".join(reasons), 409, "screening_ineligible", {"reasons": reasons})
+                if screening["status"] == "pending_review":
+                    raise BusinessError("筛选待复核，暂不能入组：" + "；".join(reasons), 409, "screening_pending_review", {"reasons": reasons})
+                if self._lab_expired(trial, screening["lab_date"]):
+                    raise BusinessError(
+                        f"关键化验已超出 {trial['lab_validity_days']} 天有效期，需复查后重新筛选", 409, "screening_lab_expired",
+                        {"lab_date": screening["lab_date"], "lab_validity_days": trial["lab_validity_days"]},
+                    )
                 stratum = self._stratum(conn, trial, factors, actor["site_id"])
                 allocation = self._next_allocation(conn, trial, stratum)
                 allocation_code = hashlib.sha256(f"{trial_id}:{external_id}".encode()).hexdigest()[:12].upper()
@@ -386,10 +558,15 @@ class RandomizationStore:
             by_site = conn.execute(
                 f"SELECT site_id,COUNT(*) AS count FROM participants WHERE trial_id=?" + where + " GROUP BY site_id", params
             ).fetchall()
+            screening_rows = conn.execute(
+                f"SELECT status,COUNT(*) AS count FROM screenings WHERE trial_id=? AND superseded=0" + where + " GROUP BY status", params
+            ).fetchall()
             audit = conn.execute("SELECT * FROM audit_log WHERE trial_id=? ORDER BY id", (trial_id,)).fetchall()
             return {
-                "trial": {"id": trial["id"], "name": trial["name"], "protocol_version": trial["protocol_version"], "status": trial["status"]},
+                "trial": {"id": trial["id"], "name": trial["name"], "protocol_version": trial["protocol_version"], "status": trial["status"],
+                          "min_age": trial["min_age"], "lab_validity_days": trial["lab_validity_days"]},
                 "participants_visible": total, "by_site": [dict(x) for x in by_site],
+                "screening_status": {row["status"]: row["count"] for row in screening_rows},
                 "audit": [dict(x) | {"detail": json.loads(x["detail"])} for x in audit],
             }
 
@@ -416,13 +593,18 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers(); self.wfile.write(body); return
         if method == "GET" and path == "/health": return self._send(200, {"ok": True})
         if parts == ["api", "trials"] and method == "POST":
-            d=self._body(); return self._send(201, store.create_trial(user,d.get("name",""),d.get("protocol_version",""),d.get("arms"),d.get("strata_factors"),d.get("block_size"),d.get("seed","")))
+            d=self._body(); return self._send(201, store.create_trial(user,d.get("name",""),d.get("protocol_version",""),d.get("arms"),d.get("strata_factors"),d.get("block_size"),d.get("seed",""),d.get("min_age"),d.get("lab_validity_days")))
         if len(parts) >= 3 and parts[:2] == ["api", "trials"]:
             trial_id=int(parts[2])
             if len(parts)==4 and parts[3]=="protocol" and method=="POST":
-                d=self._body(); return self._send(200, store.update_protocol(user,trial_id,d.get("protocol_version",""),d.get("arms"),d.get("strata_factors"),d.get("block_size"),d.get("seed")))
+                d=self._body(); return self._send(200, store.update_protocol(user,trial_id,d.get("protocol_version",""),d.get("arms"),d.get("strata_factors"),d.get("block_size"),d.get("seed"),d.get("min_age"),d.get("lab_validity_days")))
             if len(parts)==4 and parts[3]=="start" and method=="POST": return self._send(200, store.start_trial(user,trial_id))
             if len(parts)==4 and parts[3]=="participants" and method=="GET": return self._send(200, {"items": store.list_participants(user,trial_id)})
+            if len(parts)==4 and parts[3]=="screenings" and method=="POST":
+                d=self._body(); return self._send(201, store.submit_screening(user,trial_id,d.get("external_id",""),d.get("consent_signed"),d.get("consent_date"),d.get("age"),d.get("lab_date"),d.get("lab_result")))
+            if len(parts)==4 and parts[3]=="screenings" and method=="GET":
+                ext=(parse_qs(urlparse(self.path).query).get("external_id") or [None])[0]
+                return self._send(200, {"items": store.list_screenings(user,trial_id,ext)})
             if len(parts)==4 and parts[3]=="enroll" and method=="POST":
                 d=self._body(); return self._send(201, store.enroll(user,trial_id,d.get("external_id",""),d.get("factors",{})))
             if len(parts)==4 and parts[3]=="summary" and method=="GET": return self._send(200, store.trial_summary(user,trial_id))
@@ -434,7 +616,10 @@ class Handler(BaseHTTPRequestHandler):
         raise BusinessError("接口不存在",404,"not_found")
     def _handle(self, method):
         try: self._dispatch(method)
-        except BusinessError as exc: self._send(exc.status,{"error":{"code":exc.code,"message":exc.message}})
+        except BusinessError as exc:
+            payload={"error":{"code":exc.code,"message":exc.message}}
+            if exc.detail: payload["error"]["detail"]=exc.detail
+            self._send(exc.status,payload)
         except (ValueError,TypeError): self._send(400,{"error":{"code":"invalid_path","message":"路径参数格式错误"}})
         except Exception as exc: self._send(500,{"error":{"code":"internal_error","message":str(exc)}})
     def do_GET(self): self._handle("GET")

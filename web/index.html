@@ -1,4 +1,79 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>
+body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}
+select,button,input{padding:8px;margin:4px}
+pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}
+.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}
+.badge{padding:2px 10px;border-radius:10px;color:#fff;font-size:13px;white-space:nowrap}
+.eligible{background:#2e7d32}.ineligible{background:#c62828}.pending_review{background:#ef6c00}
+table{border-collapse:collapse;width:100%;margin-top:8px}td,th{border:1px solid #ccc;padding:6px;text-align:left;font-size:14px}
+.msg{margin-top:8px;padding:8px;border-radius:6px;background:#f4f4f4;white-space:pre-wrap}
+.msg.err{background:#fdecea;color:#b71c1c}
+</style></head>
+<body><h1>临床试验随机分配与盲法</h1>
+<div class="panel">
+  <select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select>
+  试验 <input id="trial" value="1" size="4">
+  <button onclick="load()">查看试验摘要</button>
+  <button onclick="loadScreenings()">刷新筛选记录</button>
+</div>
+<div class="panel"><h2>入组前筛选登记</h2>
+  受试者 <input id="s_external" placeholder="如 S001-001">
+  年龄 <input id="s_age" type="number" min="0" max="150" style="width:70px">
+  <label><input id="s_consent" type="checkbox"> 已签署知情同意</label>
+  同意日期 <input id="s_consent_date" type="date">
+  化验日期 <input id="s_lab_date" type="date">
+  化验结果 <select id="s_lab"><option value="normal">正常</option><option value="abnormal">异常</option><option value="pending">未回报</option></select>
+  <button onclick="submitScreening()">提交筛选</button>
+  <div id="s_result"></div>
+</div>
+<div class="panel"><h2>筛选记录</h2>
+  按受试者查历史(含重筛) <input id="s_filter" placeholder="外部编号,留空看当前状态">
+  <button onclick="loadScreenings()">查询</button>
+  <div id="s_list"></div>
+</div>
+<div class="panel"><h2>入组(发随机号)</h2>
+  受试者 <input id="e_external" placeholder="外部编号">
+  分层因素(JSON) <input id="e_factors" value='{"risk":"low"}' size="28">
+  <button onclick="enroll()">入组</button>
+  <div id="e_result"></div>
+</div>
+<pre id="out"></pre>
+<script>
+const $=id=>document.getElementById(id);
+const H=()=>({"X-User-Id":$("user").value,"Content-Type":"application/json"});
+const STATUS={eligible:"合格",ineligible:"不合格",pending_review:"待复核"};
+const LAB={normal:"正常",abnormal:"异常",pending:"未回报"};
+function show(el,data,isErr){el.className="msg"+(isErr?" err":"");el.textContent=typeof data==="string"?data:JSON.stringify(data,null,2)}
+function errText(j){let t=j.error?j.error.code+": "+j.error.message:JSON.stringify(j);if(j.error&&j.error.detail&&j.error.detail.reasons)t+="\n原因: "+j.error.detail.reasons.join("；");return t}
+async function load(){const r=await fetch(`/api/trials/${$("trial").value}/summary`,{headers:H()});show($("out"),await r.json())}
+async function submitScreening(){
+  const body={external_id:$("s_external").value,consent_signed:$("s_consent").checked,consent_date:$("s_consent_date").value||null,
+    age:parseInt($("s_age").value,10),lab_date:$("s_lab_date").value,lab_result:$("s_lab").value};
+  const r=await fetch(`/api/trials/${$("trial").value}/screenings`,{method:"POST",headers:H(),body:JSON.stringify(body)});
+  const j=await r.json();
+  if(r.ok){show($("s_result"),`判定: ${STATUS[j.status]}(${j.status}) 第 ${j.attempt} 次筛选`+(j.reasons.length?"\n原因: "+j.reasons.join("；"):"")+(j.enrollable?"\n可入组":""));loadScreenings()}
+  else show($("s_result"),errText(j),true);
+}
+async function loadScreenings(){
+  const ext=$("s_filter").value.trim();
+  const url=`/api/trials/${$("trial").value}/screenings`+(ext?`?external_id=${encodeURIComponent(ext)}`:"");
+  const r=await fetch(url,{headers:H()});const j=await r.json();
+  if(!r.ok){show($("s_list"),errText(j),true);return}
+  if(!j.items.length){show($("s_list"),"暂无筛选记录");return}
+  let h="<table><tr><th>受试者</th><th>中心</th><th>次数</th><th>状态</th><th>原因</th><th>年龄</th><th>化验</th><th>可入组</th></tr>";
+  for(const s of j.items){
+    h+=`<tr${s.superseded?' style="opacity:.5"':""}><td>${s.external_id}</td><td>${s.site_id}</td><td>${s.attempt}${s.superseded?"(历史)":""}</td>`
+     +`<td><span class="badge ${s.status}">${STATUS[s.status]}</span></td><td>${s.reasons.join("；")||"-"}</td>`
+     +`<td>${s.age}</td><td>${s.lab_date} ${LAB[s.lab_result]}${s.lab_expired?" <b style='color:#c62828'>已过期</b>":""}</td>`
+     +`<td>${s.enrollable?"✓":"✗"}</td></tr>`;
+  }
+  $("s_list").innerHTML=h+"</table>";
+}
+async function enroll(){
+  let factors;try{factors=JSON.parse($("e_factors").value)}catch(e){show($("e_result"),"分层因素必须是合法 JSON",true);return}
+  const r=await fetch(`/api/trials/${$("trial").value}/enroll`,{method:"POST",headers:H(),body:JSON.stringify({external_id:$("e_external").value,factors})});
+  const j=await r.json();
+  if(r.ok)show($("e_result"),j);else show($("e_result"),errText(j),true);
+}
+</script></body></html>
